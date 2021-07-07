@@ -50,6 +50,8 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+import cv2
+import numpy as np
 
 __appname__ = 'labelImg'
 
@@ -274,6 +276,7 @@ class MainWindow(QMainWindow, WindowMixin):
                         'w', 'new', get_str('crtBoxDetail'), enabled=False)
         delete = action(get_str('delBox'), self.delete_selected_shape,
                         'Delete', 'delete', get_str('delBoxDetail'), enabled=False)
+        findBoxes = action(get_str('findBoxes'), self.find_similar, enabled=False)
         copy = action(get_str('dupBox'), self.copy_selected_shape,
                       'Ctrl+D', 'copy', get_str('dupBoxDetail'),
                       enabled=False)
@@ -355,8 +358,9 @@ class MainWindow(QMainWindow, WindowMixin):
         self.draw_squares_option.triggered.connect(self.toggle_draw_square)
 
         # Store actions for further handling.
-        self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close, resetAll=reset_all, deleteImg=delete_image,
-                              lineColor=color1, create=create, delete=delete, edit=edit, copy=copy,
+        self.actions = Struct(save=save, save_format=save_format, saveAs=save_as, open=open, close=close,
+                              resetAll=reset_all, deleteImg=delete_image,
+                              lineColor=color1, create=create, delete=delete, findBoxes=findBoxes, edit=edit, copy=copy,
                               createMode=create_mode, editMode=edit_mode, advancedMode=advanced_mode,
                               shapeLineColor=shape_line_color, shapeFillColor=shape_fill_color,
                               zoom=zoom, zoomIn=zoom_in, zoomOut=zoom_out, zoomOrg=zoom_org,
@@ -367,7 +371,7 @@ class MainWindow(QMainWindow, WindowMixin):
                               beginner=(), advanced=(),
                               editMenu=(edit, copy, delete,
                                         None, color1, self.draw_squares_option),
-                              beginnerContext=(create, edit, copy, delete),
+                              beginnerContext=(create, edit, copy, delete, findBoxes),
                               advancedContext=(create_mode, edit_mode, edit, copy,
                                                delete, shape_line_color, shape_fill_color),
                               onLoadActive=(
@@ -775,6 +779,7 @@ class MainWindow(QMainWindow, WindowMixin):
             else:
                 self.label_list.clearSelection()
         self.actions.delete.setEnabled(selected)
+        self.actions.findBoxes.setEnabled(selected)
         self.actions.copy.setEnabled(selected)
         self.actions.edit.setEnabled(selected)
         self.actions.shapeLineColor.setEnabled(selected)
@@ -1498,6 +1503,77 @@ class MainWindow(QMainWindow, WindowMixin):
         if self.no_shapes():
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
+
+    def getImageAsCVImage(self):
+        '''  Converts a QImage into an opencv MAT format  '''
+
+        incomingImage = self.image.convertToFormat(4)
+
+        width = incomingImage.width()
+        height = incomingImage.height()
+
+        ptr = incomingImage.bits()
+        ptr.setsize(incomingImage.byteCount())
+        arr = np.array(ptr).reshape(height, width, 4)  # Copies the data
+        return arr
+
+    def find_similar(self):
+        # print("##TODO")
+        print(self.canvas.selected_shape)
+        minX = minY = 100000
+        maxX = maxY = -1
+        for point in self.canvas.selected_shape.points:
+            minX = int(min(minX, point.x()))
+            minY = int(min(minY, point.y()))
+            maxX = int(max(maxX, point.x()))
+            maxY = int(max(maxY, point.y()))
+        # print("done")
+        image = self.getImageAsCVImage()
+        template = image[minY:maxY, minX:maxX]
+
+        h, w = template.shape[:2]
+        result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+
+        # print("current is %d and %d" % (minX, minY))
+
+        new_shapes = []
+
+        threshold = 0.95
+        max_val = 1.0
+        last_max_loc = None
+        while max_val >= threshold:
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            if max_val >= threshold:
+                if last_max_loc == max_loc:
+                    # User propably did a wrong selection, like just white background, and it would be stuck in an infinite loop
+                    return
+                last_max_loc = max_loc
+                coords = np.unravel_index(result.argmax(), result.shape)
+                result[max_loc[1] - h // 2: max_loc[1] + h // 2 + 1, max_loc[0] - w // 2: max_loc[0] + w // 2 + 1] = 0
+                # print("at %d and %d with accuracy %d" % (coords[1], coords[0], max_val))
+                # print(max_val)
+
+                if coords[1] == minX and coords[0] == minY:
+                    continue
+
+                shape = self.canvas.selected_shape.copy()
+                shape.selected = False
+                shape.points[0] = QPointF(coords[1], coords[0])
+                shape.points[1] = QPointF(coords[1]+w, coords[0])
+                shape.points[2] = QPointF(coords[1]+w, coords[0]+h)
+                shape.points[3] = QPointF(coords[1], coords[0]+h)
+
+                assert shape
+                if shape.points[0] == shape.points[-1]:
+                    continue
+
+                new_shapes.append(shape)
+
+        for shape in new_shapes:
+            self.canvas.shapes.append(shape)
+            self.add_label(shape)
+            self.canvas.update()
+        self.set_dirty()
 
     def choose_shape_line_color(self):
         color = self.color_dialog.getColor(self.line_color, u'Choose Line Color',
