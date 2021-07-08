@@ -43,6 +43,7 @@ from libs.colorDialog import ColorDialog
 from libs.labelFile import LabelFile, LabelFileError, LabelFileFormat
 from libs.toolBar import ToolBar
 from libs.pascal_voc_io import PascalVocReader
+from libs.pascal_voc_io import PascalVocWriter
 from libs.pascal_voc_io import XML_EXT
 from libs.yolo_io import YoloReader
 from libs.yolo_io import TXT_EXT
@@ -276,7 +277,7 @@ class MainWindow(QMainWindow, WindowMixin):
                         'w', 'new', get_str('crtBoxDetail'), enabled=False)
         delete = action(get_str('delBox'), self.delete_selected_shape,
                         'Delete', 'delete', get_str('delBoxDetail'), enabled=False)
-        findBoxes = action(get_str('findBoxes'), self.find_similar, enabled=False)
+        findBoxes = action(get_str('findBoxes'), self.findSimilarEverywhere, enabled=False)
         copy = action(get_str('dupBox'), self.copy_selected_shape,
                       'Ctrl+D', 'copy', get_str('dupBoxDetail'),
                       enabled=False)
@@ -1480,6 +1481,12 @@ class MainWindow(QMainWindow, WindowMixin):
         msg = u'You have unsaved changes, would you like to save them and proceed?\nClick "No" to undo all changes.'
         return QMessageBox.warning(self, u'Attention', msg, yes | no | cancel)
 
+    def shouldAnnotateSimilarAcrossFiles(self, shapeCount, fileCount):
+        yes, no, cancel = QMessageBox.Yes, QMessageBox.No, QMessageBox.Cancel
+        msg = u'Do you really want to annotate ' + str(shapeCount) + " objects across " + str(fileCount) + " different files?"
+        return QMessageBox.warning(self, u'Attention', msg, yes | no | cancel)
+
+
     def error_message(self, title, message):
         return QMessageBox.critical(self, title,
                                     '<p><b>%s</b></p>%s' % (title, message))
@@ -1504,22 +1511,8 @@ class MainWindow(QMainWindow, WindowMixin):
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
 
-    def getImageAsCVImage(self):
-        '''  Converts a QImage into an opencv MAT format  '''
-
-        incomingImage = self.image.convertToFormat(4)
-
-        width = incomingImage.width()
-        height = incomingImage.height()
-
-        ptr = incomingImage.bits()
-        ptr.setsize(incomingImage.byteCount())
-        arr = np.array(ptr).reshape(height, width, 4)  # Copies the data
-        return arr
-
-    def find_similar(self):
-        # print("##TODO")
-        print(self.canvas.selected_shape)
+    def findSimilarEverywhere(self):
+        self.save_file()
         minX = minY = 100000
         maxX = maxY = -1
         for point in self.canvas.selected_shape.points:
@@ -1527,14 +1520,94 @@ class MainWindow(QMainWindow, WindowMixin):
             minY = int(min(minY, point.y()))
             maxX = int(max(maxX, point.x()))
             maxY = int(max(maxY, point.y()))
-        # print("done")
-        image = self.getImageAsCVImage()
+
+        startPath = self.file_path
+
+        currentImage = cv2.imread(self.file_path)
+        template = currentImage[minY:maxY, minX:maxX]
+        h, w = template.shape[:2]
+
+
+        fileCount = 0
+        shapeCount = 0
+        new_shapes = {}
+
+        for file_path in self.m_img_list:
+            file_path = ustr(file_path)
+            unicode_file_path = ustr(file_path)
+            unicode_file_path = os.path.abspath(unicode_file_path)
+
+            if unicode_file_path and os.path.exists(unicode_file_path):
+                imageNewShapes = []
+
+                image = cv2.imread(unicode_file_path)
+                result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+                threshold = 0.95
+                max_val = 1.0
+                last_max_loc = None
+                while max_val >= threshold:
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    if max_val >= threshold:
+                        if last_max_loc == max_loc:
+                            # User propably did a wrong selection, like just white background, and it would be stuck in an infinite loop
+                            return
+                        last_max_loc = max_loc
+                        coords = np.unravel_index(result.argmax(), result.shape)
+                        result[max_loc[1] - h // 2: max_loc[1] + h // 2 + 1,
+                        max_loc[0] - w // 2: max_loc[0] + w // 2 + 1] = 0
+
+                        if coords[1] == minX and coords[0] == minY and unicode_file_path == self.file_path:
+                            continue
+
+                        shape = self.canvas.selected_shape.copy()
+                        shape.selected = False
+                        shape.points[0] = QPointF(coords[1], coords[0])
+                        shape.points[1] = QPointF(coords[1] + w, coords[0])
+                        shape.points[2] = QPointF(coords[1] + w, coords[0] + h)
+                        shape.points[3] = QPointF(coords[1], coords[0] + h)
+
+                        assert shape
+                        if shape.points[0] == shape.points[-1]:
+                            continue
+
+                        imageNewShapes.append(shape)
+                if len(imageNewShapes) > 0:
+                    new_shapes[unicode_file_path] = imageNewShapes
+                    fileCount += 1
+                    shapeCount += len(imageNewShapes)
+
+        if self.shouldAnnotateSimilarAcrossFiles(shapeCount, fileCount) != QMessageBox.Yes:
+            return
+
+        for file_path in self.m_img_list:
+            file_path = ustr(file_path)
+            unicode_file_path = ustr(file_path)
+            unicode_file_path = os.path.abspath(unicode_file_path)
+
+            if unicode_file_path and os.path.exists(unicode_file_path):
+                self.load_file(unicode_file_path)
+                for shape in new_shapes[unicode_file_path]:
+                    self.canvas.shapes.append(shape)
+                    self.add_label(shape)
+                    self.canvas.update()
+                self.set_dirty()
+                self.save_file()
+        self.load_file(startPath)
+
+    def find_similar(self):
+        minX = minY = 100000
+        maxX = maxY = -1
+        for point in self.canvas.selected_shape.points:
+            minX = int(min(minX, point.x()))
+            minY = int(min(minY, point.y()))
+            maxX = int(max(maxX, point.x()))
+            maxY = int(max(maxY, point.y()))
+
+        image = cv2.imread(self.file_path)
         template = image[minY:maxY, minX:maxX]
 
         h, w = template.shape[:2]
         result = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
-
-        # print("current is %d and %d" % (minX, minY))
 
         new_shapes = []
 
@@ -1550,8 +1623,6 @@ class MainWindow(QMainWindow, WindowMixin):
                 last_max_loc = max_loc
                 coords = np.unravel_index(result.argmax(), result.shape)
                 result[max_loc[1] - h // 2: max_loc[1] + h // 2 + 1, max_loc[0] - w // 2: max_loc[0] + w // 2 + 1] = 0
-                # print("at %d and %d with accuracy %d" % (coords[1], coords[0], max_val))
-                # print(max_val)
 
                 if coords[1] == minX and coords[0] == minY:
                     continue
